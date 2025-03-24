@@ -40,12 +40,11 @@ fn main() {
             Some(KeyboardKey::KEY_SPACE) => camera.position.z += z,
             Some(KeyboardKey::KEY_LEFT_SHIFT) => camera.position.z -= z,
             _ => {}
-            None => {}
         }
 
         d.clear_background(Color::BLACK);
         d.draw_text(&format!("{}, {}", window_x, window_y), 0, 0, 30, Color::LIME);
-        d.draw_text(&format!("{}, {} {}", camera.position.x, camera.position.y, camera.position.z), 0, 50, 30, Color::RED);
+        d.draw_text(&format!("{}, {}, {}", camera.position.x, camera.position.y, camera.position.z), 0, 50, 30, Color::RED);
         d.draw_fps(0, 100);
     }
 }
