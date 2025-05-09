@@ -1,4 +1,4 @@
-use raylib::{ffi::{SetConfigFlags, CameraProjection::CAMERA_PERSPECTIVE}, prelude::*};
+use raylib::{core::models::RaylibMesh, ffi::{DrawModel, GenMeshCube, LoadModelFromMesh, SetConfigFlags}, prelude::*};
 
 enum State {
     Menu,
@@ -26,6 +26,12 @@ fn main() {
     );
     rl.set_target_fps(FPS);
     let (x, y, z) = (5.0, 5.0, 5.0);
+    let mut mesh: ffi::Mesh;
+    let mut model: ffi::Model;
+    unsafe {
+        mesh = GenMeshCube(1.0, 1.0, 1.0);
+        model = LoadModelFromMesh(mesh);
+    }
     while !rl.window_should_close() {
         let mut d = rl.begin_drawing(&thread);
         d.clear_background(Color::BLACK);
@@ -35,17 +41,20 @@ fn main() {
         window_y = d.get_render_height();
         match key {
             Some(KeyboardKey::KEY_W) => camera.position.x += x,
-            Some(KeyboardKey::KEY_A) => camera.position.y -= y,
+            Some(KeyboardKey::KEY_A) => camera.position.z -= z,
             Some(KeyboardKey::KEY_S) => camera.position.x -= x,
-            Some(KeyboardKey::KEY_D) => camera.position.y += y,
-            Some(KeyboardKey::KEY_SPACE) => camera.position.z += z,
-            Some(KeyboardKey::KEY_LEFT_SHIFT) => camera.position.z -= z,
+            Some(KeyboardKey::KEY_D) => camera.position.z += z,
+            Some(KeyboardKey::KEY_SPACE) => camera.position.y += y,
+            Some(KeyboardKey::KEY_LEFT_SHIFT) => camera.position.y -= y,
             _ => {}
         }
 
         {
             let mut d3= d.begin_mode3D(camera);
             d3.draw_grid(10, 1.0);
+            unsafe {
+                DrawModel(model, raylib::ffi::Vector3{x: 0.0, y: 0.0, z: 0.0}, 1.0, raylib::ffi::ColorFromHSV(1.0, 1.0, 1.0));
+            }
         }
         //d.draw_g
         d.draw_text(&format!("{}, {}", window_x, window_y), 0, 0, 30, Color::LIME);
