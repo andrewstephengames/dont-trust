@@ -180,8 +180,6 @@ fn main() {
         // position.y += 2.0*dt;
         d.clear_background(Color::SKYBLUE);
         let mouse = d.get_mouse_position();
-        camera.target = Vector3{x: -mouse.x, y: -mouse.y, z: mouse.x};
-        player_direction = get_movement_vector(&camera);
         
 		//         unsafe {
 		//     // Raw movement input
@@ -201,31 +199,33 @@ fn main() {
 		// }
         // 
 
-        camera.position += player_direction * player_speed * dt;
-        camera.target += player_direction * player_speed * dt;
         if let Some(terrain_y) = get_height_at(camera.position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize) {
 	        if camera.position.y < terrain_y+5.0 {
-                camera.position.y = terrain_y;
+                camera.position.y = terrain_y+5.1;
 	        }
         }
         let key = d.get_key_pressed();
         window_x = d.get_render_width();
         window_y = d.get_render_height();
-        // let mouse_delta = d.get_mouse_delta();
-		// let sensitivity = 0.003;
-		// yaw += mouse_delta.x * sensitivity;
-		// pitch -= mouse_delta.y * sensitivity;
+           let mouse_delta = d.get_mouse_delta();
+	    let sensitivity = 0.003;
+	    yaw += mouse_delta.x * sensitivity;
+	    pitch -= mouse_delta.y * sensitivity;
+	    
+	    let pitch_limit = std::f32::consts::FRAC_PI_2 - 0.01;
+	    pitch = pitch.clamp(-pitch_limit, pitch_limit);
+	    
+	    let forward = Vector3 {
+	        x: pitch.cos() * yaw.sin(),
+	        y: pitch.sin(),
+	        z: pitch.cos() * yaw.cos() * -1.0
+	    };
 		
-		// let pitch_limit = std::f32::consts::FRAC_PI_2 - 0.01;
-		// pitch = pitch.clamp(-pitch_limit, pitch_limit);
-		
-		// let direction = Vector3 {
-		//     x: pitch.cos() * yaw.sin(),
-		//     y: pitch.sin(),
-		//     z: pitch.cos() * yaw.cos() * -1.0
-		// };
-		
-		// camera.target = camera.position + direction;
+        player_direction = get_movement_vector(&camera);
+        camera.position += player_direction * player_speed * dt;
+        
+        camera.target = camera.position + forward;
+
         // match key {
         //     Some(KeyboardKey::KEY_A) => camera.position.x += x,
         //     Some(KeyboardKey::KEY_S) => camera.position.z -= z,
