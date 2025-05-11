@@ -18,8 +18,9 @@ const MAP_SIZE: ffi::Vector2 = ffi::Vector2{x: 500.0, y: 500.0};
 const MAP_SCALE: f32 = MAP_SIZE.x*0.05;
 const GRID_SIZE: ffi::Vector2 = NOISE_SIZE;
 const PLAYER_HEIGHT: f32 = 5.0;
-const COLLISION_OFFSET: f32 = 0.1;
-const MAX_HEIGHT: f32 = 15.0;
+const GRAVITY: f32 = 15.0;
+const NORMAL: f32 = 5.0;
+const TERRAIN_DELTA: f32 = 0.2;
 
 fn real_vec3_add (v1: Vector3, v2: Vector3) -> Vector3 {
     Vector3 {x: v1.x+v2.x, y: v1.y+v2.y, z: v1.z+v2.z}
@@ -75,9 +76,9 @@ fn adjust_position(position: Vector3, terrain_origin: Vector3, vertices: &[Vecto
 
 fn get_height_at(world_pos: Vector3, terrain_origin: Vector3, grid: &Vec<Vector3>, width: usize, depth: usize) -> Option<f32> {
     // First check if position is within reasonable bounds
-    if world_pos.y > terrain_origin.y + MAX_HEIGHT + PLAYER_HEIGHT { //
-        return None; // Early exit if already way above terrain
-    }
+    // if world_pos.y > terrain_origin.y + MAX_HEIGHT + PLAYER_HEIGHT { //
+    //     return None; // Early exit if already way above terrain
+    // }
 
     let grid_cell_size = MAP_SIZE.x / (width as f32 - 1.0);
     let local_x = ((world_pos.x - terrain_origin.x) / grid_cell_size).floor() as usize;
@@ -106,6 +107,7 @@ fn get_height_at(world_pos: Vector3, terrain_origin: Vector3, grid: &Vec<Vector3
     };
 
     // Clamp height to reasonable range
+    const MAX_HEIGHT: f32 = 999.0;
     let final_height = height.clamp(terrain_origin.y, terrain_origin.y + MAX_HEIGHT); //
     Some(final_height)
 }
@@ -210,6 +212,7 @@ fn main() {
     let terrain_vertices;
     let terrain_vertex_count;
 	let mut mesh_points ;
+    let mut is_grounded = true;
     unsafe {
         mesh = GenMeshCube(1.0, 1.0, 1.0);
         cylinder_mesh = GenMeshCylinder(1.0, 2.0, 100);
@@ -295,6 +298,10 @@ fn main() {
         player_direction = get_movement_vector(&camera);
         let desired_position = camera.position + player_direction * player_speed * dt;
         
+        // if is_grounded && IsKeyPressed(KeyboardKey::KEY_SPACE) {
+        //     velocity
+        // }
+        
         let mut new_position = desired_position;
         if check_collision(desired_position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize) {
             new_position = adjust_position(desired_position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize);
@@ -312,7 +319,8 @@ fn main() {
 
         // Draw debug information
         if let Some(ground_height) = get_closest_vertex_height(camera.position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize) {
-            d.draw_text(&format!("Ground Height: {:.2}", ground_height), 10, 100, 20, Color::RED);
+            // d.draw_text(&format!("Ground Height: {:.2}", ground_height), 10, 200, 20, Color::RED);
+            println! ("{:.2}", ground_height);
         }
 
         // Then handle vertical movement separately
@@ -384,7 +392,17 @@ fn main() {
 
         {
             let mut d3= d.begin_mode3D(camera);
+            let rings = 10;
             // d3.draw_grid(100, 1.0);
+            // d3.draw_sphere_wires(Vector3{x: -250.0, y: 800.0, z: -250.0}, 200.0, rings, rings, Color::BLACK);
+            // d3.draw_sphere_wires(Vector3{x: -248.0, y: 795.0, z: -250.0}, 199.5, rings, rings, Color::BLACK);
+            // d3.draw_sphere_wires(Vector3{x: -246.0, y: 790.0, z: -250.0}, 199.0, rings, rings, Color::BLACK);
+            // d3.draw_sphere_wires(Vector3{x: -244.0, y: 785.0, z: -250.0}, 198.5, rings, rings, Color::BLACK);
+            // d3.draw_sphere_wires(Vector3{x: -242.0, y: 780.0, z: -250.0}, 198.0, rings, rings, Color::BLACK);
+            // // d3.draw_sphere_ex(Vector3{x: -250.0, y: 690.0, z: -250.0}, 100.0, rings, rings, Color::BLACK);
+            // d3.draw_sphere_ex(Vector3{x: -250.0, y: 800.0, z: -250.0}, 200.0, rings, rings, Color::WHITE);
+            d3.draw_sphere_ex(Vector3{x: 0.0, y: 150.0, z: -800.0}, 15.0, rings, rings, Color::YELLOW);
+            d3.draw_sphere_ex(Vector3{x: 0.0, y: 150.0, z: -800.0}, 12.0, rings, rings, Color::ORANGE);
             unsafe {
                 // for i in 0..25 {
                 //     for j in 0..25 {
@@ -396,7 +414,7 @@ fn main() {
             // d3.draw_line_3D(Vector3{x: -4.0, y: 0.0, z: -2.0}, Vector3{x: 5.0, y: 2.0, z: 3.0}, Color::LIME);
         }
         d.draw_text(&format!("{}, {}", window_x, window_y), 0, 0, 30, Color::LIME);
-        d.draw_text(&format!("{}, {}, {}", camera.position.x, camera.position.y, camera.position.z), 0, 50, 30, Color::RED);
+        d.draw_text(&format!("{:3.2}, {:3.2}, {:3.2}", camera.position.x, camera.position.y, camera.position.z), 0, 50, 30, Color::RED);
         d.draw_fps(0, 100);
     }
 }
