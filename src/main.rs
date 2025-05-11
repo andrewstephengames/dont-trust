@@ -17,6 +17,9 @@ const NOISE_SIZE: ffi::Vector2 = ffi::Vector2{x: 128.0, y: 128.0};
 const MAP_SIZE: ffi::Vector2 = ffi::Vector2{x: 500.0, y: 500.0};
 const MAP_SCALE: f32 = MAP_SIZE.x*0.05;
 const GRID_SIZE: ffi::Vector2 = NOISE_SIZE;
+const PLAYER_HEIGHT: f32 = 5.0;
+const COLLISION_OFFSET: f32 = 0.1;
+const MAX_HEIGHT: f32 = 15.0;
 
 fn real_vec3_add (v1: Vector3, v2: Vector3) -> Vector3 {
     Vector3 {x: v1.x+v2.x, y: v1.y+v2.y, z: v1.z+v2.z}
@@ -26,18 +29,86 @@ fn real_vec3_sub (v1: Vector3, v2: Vector3) -> Vector3 {
     Vector3 {x: v1.x-v2.x, y: v1.y-v2.y, z: v1.z-v2.z}
 }
 
-fn get_height_at(world_pos: Vector3, terrain_origin: Vector3, grid: &Vec<Vector3>, width: usize, depth: usize) -> Option<f32> {
-    let local_x = ((world_pos.x - terrain_origin.x) / (GRID_SIZE.x / width as f32)).floor() as usize;
-    let local_z = ((world_pos.z - terrain_origin.z) / (GRID_SIZE.y / depth as f32)).floor() as usize;
+fn get_closest_vertex_height(world_pos: Vector3, terrain_origin: Vector3, vertices: &[Vector3], width: usize, depth: usize) -> Option<f32> {
+    let grid_cell_size = MAP_SIZE.x / (width as f32 - 1.0);
+    let local_x = ((world_pos.x - terrain_origin.x) / grid_cell_size).round() as usize;
+    let local_z = ((world_pos.z - terrain_origin.z) / grid_cell_size).round() as usize;
 
-    if local_x < width && local_z < depth {
-        let index = local_z * width + local_x;
-        Some(grid[index].y + terrain_origin.y)
+    if local_x >= width || local_z >= depth {
+        return None;
+    }
+
+    let index = local_z * width + local_x;
+    Some(vertices[index].y + terrain_origin.y)
+}
+
+fn check_collision(position: Vector3, terrain_origin: Vector3, vertices: &[Vector3], width: usize, depth: usize) -> bool {
+    if let Some(ground_height) = get_closest_vertex_height(position, terrain_origin, vertices, width, depth) {
+        position.y < ground_height + PLAYER_HEIGHT
     } else {
-        None
+        false
     }
 }
 
+fn adjust_position(position: Vector3, terrain_origin: Vector3, vertices: &[Vector3], width: usize, depth: usize) -> Vector3 {
+    let mut adjusted_pos = position;
+    if let Some(ground_height) = get_closest_vertex_height(position, terrain_origin, vertices, width, depth) {
+        if position.y < ground_height + PLAYER_HEIGHT {
+            adjusted_pos.y = ground_height + PLAYER_HEIGHT;
+        }
+    }
+    adjusted_pos
+}
+
+
+// fn get_height_at(world_pos: Vector3, terrain_origin: Vector3, grid: &Vec<Vector3>, width: usize, depth: usize) -> Option<f32> {
+//     let local_x = ((world_pos.x - terrain_origin.x) / (GRID_SIZE.x / width as f32)).floor() as usize;
+//     let local_z = ((world_pos.z - terrain_origin.z) / (GRID_SIZE.y / depth as f32)).floor() as usize;
+
+//     if local_x < width && local_z < depth {
+//         let index = local_z * width + local_x;
+//         Some(grid[index].y + terrain_origin.y)
+//     } else {
+//         None
+//     }
+// }
+
+fn get_height_at(world_pos: Vector3, terrain_origin: Vector3, grid: &Vec<Vector3>, width: usize, depth: usize) -> Option<f32> {
+    // First check if position is within reasonable bounds
+    if world_pos.y > terrain_origin.y + MAX_HEIGHT + PLAYER_HEIGHT { //
+        return None; // Early exit if already way above terrain
+    }
+
+    let grid_cell_size = MAP_SIZE.x / (width as f32 - 1.0);
+    let local_x = ((world_pos.x - terrain_origin.x) / grid_cell_size).floor() as usize;
+    let local_z = ((world_pos.z - terrain_origin.z) / grid_cell_size).floor() as usize;
+
+    if local_x >= width - 1 || local_z >= depth - 1 {
+        return None;
+    }
+
+    // Get the 4 nearest vertices
+    let index = local_z * width + local_x;
+    let p1 = grid[index];
+    let p2 = grid[index + 1];
+    let p3 = grid[index + width];
+    let p4 = grid[index + width + 1];
+
+    // Calculate interpolation factors
+    let tx = (world_pos.x - p1.x) / grid_cell_size;
+    let tz = (world_pos.z - p1.z) / grid_cell_size;
+
+    // Bilinear interpolation with bounds checking
+    let height = if tx + tz <= 1.0 {
+        p1.y + (p2.y - p1.y) * tx + (p3.y - p1.y) * tz
+    } else {
+        p4.y + (p2.y - p4.y) * (1.0 - tz) + (p3.y - p4.y) * (1.0 - tx)
+    };
+
+    // Clamp height to reasonable range
+    let final_height = height.clamp(terrain_origin.y, terrain_origin.y + MAX_HEIGHT); //
+    Some(final_height)
+}
 
 fn get_movement_vector(camera: &Camera3D) -> Vector3 {
     unsafe {
@@ -101,7 +172,7 @@ fn main() {
         .build();
     
     let mut camera= Camera3D::perspective(
-        Vector3 { x: -500.0, y: 25.0, z: -500.0 }, 
+        Vector3 { x: -250.0, y: 25.0, z: -250.0 }, 
         Vector3 { x: -100.0, y: 12.0, z: -100.0 },
         Vector3 {x: 0.0, y: 25.0, z: 0.0},
         45.0
@@ -199,11 +270,11 @@ fn main() {
 		// }
         // 
 
-        if let Some(terrain_y) = get_height_at(camera.position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize) {
-	        if camera.position.y < terrain_y+5.0 {
-                camera.position.y = terrain_y+5.1;
-	        }
-        }
+        // if let Some(terrain_y) = get_height_at(camera.position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize) {
+	    //     if camera.position.y < terrain_y+5.0 {
+        //         camera.position.y = terrain_y+5.1;
+	    //     }
+        // }
         let key = d.get_key_pressed();
         window_x = d.get_render_width();
         window_y = d.get_render_height();
@@ -220,11 +291,74 @@ fn main() {
 	        y: pitch.sin(),
 	        z: pitch.cos() * yaw.cos() * -1.0
 	    };
-		
-        player_direction = get_movement_vector(&camera);
-        camera.position += player_direction * player_speed * dt;
         
+        player_direction = get_movement_vector(&camera);
+        let desired_position = camera.position + player_direction * player_speed * dt;
+        
+        let mut new_position = desired_position;
+        if check_collision(desired_position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize) {
+            new_position = adjust_position(desired_position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize);
+            
+            // Cancel vertical movement if colliding from above
+            if player_direction.y < 0.0 {
+                player_direction.y = 0.0;
+                new_position = camera.position + player_direction * player_speed * dt;
+                new_position = adjust_position(new_position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize);
+            }
+        }
+
+        camera.position = new_position;
         camera.target = camera.position + forward;
+
+        // Draw debug information
+        if let Some(ground_height) = get_closest_vertex_height(camera.position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize) {
+            d.draw_text(&format!("Ground Height: {:.2}", ground_height), 10, 100, 20, Color::RED);
+        }
+
+        // Then handle vertical movement separately
+        // let vertical_direction: f32;
+        // unsafe {
+	    //     vertical_direction = if IsKeyDown(ffi::KeyboardKey::KEY_SPACE as i32) {
+	    //         1.0
+	    //     } else if IsKeyDown(ffi::KeyboardKey::KEY_LEFT_SHIFT as i32) {
+	    //         -1.0
+	    //     } else {
+	    //         0.0
+	    //     };
+
+        // }
+        // new_position.y += vertical_direction * player_speed * dt;
+
+		
+        // // player_direction = get_movement_vector(&camera);
+        // // let mut new_position = camera.position + player_direction * player_speed * dt;
+        
+        //  if let Some(terrain_y) = get_height_at(new_position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize) {
+        //     let target_height = terrain_y + PLAYER_HEIGHT;
+            
+        //     // Only adjust if we're at or below target height
+        //     if new_position.y <= target_height {
+        //         new_position.y = target_height;
+        //     }
+            
+        //     // Additional check to prevent getting stuck in steep terrain
+        //     if (new_position.y - target_height).abs() < 0.5 { //
+        //         new_position.y = target_height;
+        //     }
+        // }
+
+        
+        // if let Some(terrain_y) = get_height_at(new_position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize) { //
+        //     if new_position.y < terrain_y + PLAYER_HEIGHT { //
+        //         new_position.y = terrain_y + PLAYER_HEIGHT; //
+                
+        //         // Prevent moving downward into terrain
+        //         if player_direction.y < 0.0 { //
+        //             player_direction.y = 0.0; //
+        //         }
+        //     }
+        // }
+        
 
         // match key {
         //     Some(KeyboardKey::KEY_A) => camera.position.x += x,
