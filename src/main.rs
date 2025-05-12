@@ -1,59 +1,116 @@
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
-use std::time::SystemTime;
-use raylib::ffi::{ColorFromHSV, IsKeyDown};
+use std::sync::Arc;
 
+use tokio::sync::{mpsc, Mutex as TokioMutex};
+
+use raylib::consts::MouseButton;
+use raylib::ffi::{ColorFromHSV, KeyboardKey};
 use raylib::{
-    consts::MaterialMapIndex::*, core::{math::*, texture::*}, ffi::{DrawModel, DrawModelWires, GenImageGradientLinear, GenImagePerlinNoise, GenMeshCube, GenMeshCylinder, GenMeshHeightmap, LoadModel, LoadModelFromMesh, LoadTextureFromImage, SetConfigFlags, SetMaterialTexture, UnloadImage}, prelude::*
+    consts::MaterialMapIndex::*,
+    core::math::*, // RaylibThread is in prelude, texture::* also generally covered
+    ffi::{
+        DrawModel, DrawModelEx, GenImagePerlinNoise, GenMeshHeightmap, LoadModel,
+        LoadModelFromMesh, LoadTextureFromImage, SetConfigFlags, UnloadImage,
+    },
+    prelude::*, // Imports RaylibThread
 };
 
-enum State {
-    Menu,
-    Game,
-    Paused
+use serde::{Deserialize, Serialize};
+
+use futures_util::{SinkExt, StreamExt};
+// Use the specific version of tokio-tungstenite the compiler is using if known, or a recent one
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
+use url::Url; // Keep this if you still want to parse URLs, but connect_async will take &str
+
+
+// --- WebSocket and Game State Structures ---
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlayerState {
+    id: String,
+    position: (f32, f32, f32),
+    rotation: (f32, f32, f32),
 }
 
+struct GameState {
+    local_player_id: Option<String>,
+    other_players: HashMap<String, PlayerState>,
+    join_messages: VecDeque<String>,
+}
+
+const MAX_JOIN_MESSAGES: usize = 5;
 const FPS: u32 = 60;
-const NOISE_SIZE: ffi::Vector2 = ffi::Vector2{x: 128.0, y: 128.0};
-const MAP_SIZE: ffi::Vector2 = ffi::Vector2{x: 500.0, y: 500.0};
-const MAP_SCALE: f32 = MAP_SIZE.x*0.05;
-const GRID_SIZE: ffi::Vector2 = NOISE_SIZE;
+const NOISE_SIZE: raylib::ffi::Vector2 = raylib::ffi::Vector2 { x: 128.0, y: 128.0 };
+const MAP_SIZE: raylib::ffi::Vector2 = raylib::ffi::Vector2 { x: 500.0, y: 500.0 };
+const MAP_SCALE: f32 = MAP_SIZE.x * 0.05;
 const PLAYER_HEIGHT: f32 = 5.0;
-const GRAVITY: f32 = 15.0;
-const NORMAL: f32 = 5.0;
-const TERRAIN_DELTA: f32 = 0.2;
 
-fn real_vec3_add (v1: Vector3, v2: Vector3) -> Vector3 {
-    Vector3 {x: v1.x+v2.x, y: v1.y+v2.y, z: v1.z+v2.z}
+fn real_vec3_add(v1: Vector3, v2: Vector3) -> Vector3 {
+    Vector3 { x: v1.x + v2.x, y: v1.y + v2.y, z: v1.z + v2.z }
 }
 
-fn real_vec3_sub (v1: Vector3, v2: Vector3) -> Vector3 {
-    Vector3 {x: v1.x-v2.x, y: v1.y-v2.y, z: v1.z-v2.z}
+fn real_vec3_sub(v1: Vector3, v2: Vector3) -> Vector3 {
+    Vector3 { x: v1.x - v2.x, y: v1.y - v2.y, z: v1.z - v2.z }
 }
 
-fn get_closest_vertex_height(world_pos: Vector3, terrain_origin: Vector3, vertices: &[Vector3], width: usize, depth: usize) -> Option<f32> {
-    let grid_cell_size = MAP_SIZE.x / (width as f32 - 1.0);
-    let local_x = ((world_pos.x - terrain_origin.x) / grid_cell_size).round() as usize;
-    let local_z = ((world_pos.z - terrain_origin.z) / grid_cell_size).round() as usize;
+fn get_closest_vertex_height(
+    world_pos: Vector3,
+    terrain_origin: Vector3,
+    vertices: &[Vector3],
+    width: usize,
+    depth: usize,
+) -> Option<f32> {
+    if width == 0 || depth == 0 || vertices.is_empty() {
+        return None;
+    }
+    let grid_cell_width = MAP_SIZE.x / (width.saturating_sub(1) as f32).max(1.0);
+    let grid_cell_depth = MAP_SIZE.y / (depth.saturating_sub(1) as f32).max(1.0);
+
+    let local_x_float = (world_pos.x - terrain_origin.x) / grid_cell_width;
+    let local_z_float = (world_pos.z - terrain_origin.z) / grid_cell_depth;
+
+    let local_x = local_x_float.round() as usize;
+    let local_z = local_z_float.round() as usize;
 
     if local_x >= width || local_z >= depth {
         return None;
     }
 
     let index = local_z * width + local_x;
-    Some(vertices[index].y + terrain_origin.y)
+    if index < vertices.len() {
+        Some(vertices[index].y + terrain_origin.y)
+    } else {
+        None
+    }
 }
 
-fn check_collision(position: Vector3, terrain_origin: Vector3, vertices: &[Vector3], width: usize, depth: usize) -> bool {
-    if let Some(ground_height) = get_closest_vertex_height(position, terrain_origin, vertices, width, depth) {
+fn check_collision(
+    position: Vector3,
+    terrain_origin: Vector3,
+    vertices: &[Vector3],
+    width: usize,
+    depth: usize,
+) -> bool {
+    if let Some(ground_height) =
+        get_closest_vertex_height(position, terrain_origin, vertices, width, depth)
+    {
         position.y < ground_height + PLAYER_HEIGHT
     } else {
         false
     }
 }
 
-fn adjust_position(position: Vector3, terrain_origin: Vector3, vertices: &[Vector3], width: usize, depth: usize) -> Vector3 {
+fn adjust_position(
+    position: Vector3,
+    terrain_origin: Vector3,
+    vertices: &[Vector3],
+    width: usize,
+    depth: usize,
+) -> Vector3 {
     let mut adjusted_pos = position;
-    if let Some(ground_height) = get_closest_vertex_height(position, terrain_origin, vertices, width, depth) {
+    if let Some(ground_height) =
+        get_closest_vertex_height(position, terrain_origin, vertices, width, depth)
+    {
         if position.y < ground_height + PLAYER_HEIGHT {
             adjusted_pos.y = ground_height + PLAYER_HEIGHT;
         }
@@ -61,360 +118,396 @@ fn adjust_position(position: Vector3, terrain_origin: Vector3, vertices: &[Vecto
     adjusted_pos
 }
 
+fn get_movement_vector(rl: &RaylibHandle, camera: &Camera3D, current_yaw: f32) -> Vector3 {
+    let mut move_dir = Vector3::zero();
+    let mut forward = camera.target - camera.position;
+    forward.y = 0.0;
 
-// fn get_height_at(world_pos: Vector3, terrain_origin: Vector3, grid: &Vec<Vector3>, width: usize, depth: usize) -> Option<f32> {
-//     let local_x = ((world_pos.x - terrain_origin.x) / (GRID_SIZE.x / width as f32)).floor() as usize;
-//     let local_z = ((world_pos.z - terrain_origin.z) / (GRID_SIZE.y / depth as f32)).floor() as usize;
-
-//     if local_x < width && local_z < depth {
-//         let index = local_z * width + local_x;
-//         Some(grid[index].y + terrain_origin.y)
-//     } else {
-//         None
-//     }
-// }
-
-fn get_height_at(world_pos: Vector3, terrain_origin: Vector3, grid: &Vec<Vector3>, width: usize, depth: usize) -> Option<f32> {
-    // First check if position is within reasonable bounds
-    // if world_pos.y > terrain_origin.y + MAX_HEIGHT + PLAYER_HEIGHT { //
-    //     return None; // Early exit if already way above terrain
-    // }
-
-    let grid_cell_size = MAP_SIZE.x / (width as f32 - 1.0);
-    let local_x = ((world_pos.x - terrain_origin.x) / grid_cell_size).floor() as usize;
-    let local_z = ((world_pos.z - terrain_origin.z) / grid_cell_size).floor() as usize;
-
-    if local_x >= width - 1 || local_z >= depth - 1 {
-        return None;
+    if forward.length() < 0.0001 { 
+        forward = Vector3::new(current_yaw.sin(), 0.0, current_yaw.cos() * -1.0);
     }
-
-    // Get the 4 nearest vertices
-    let index = local_z * width + local_x;
-    let p1 = grid[index];
-    let p2 = grid[index + 1];
-    let p3 = grid[index + width];
-    let p4 = grid[index + width + 1];
-
-    // Calculate interpolation factors
-    let tx = (world_pos.x - p1.x) / grid_cell_size;
-    let tz = (world_pos.z - p1.z) / grid_cell_size;
-
-    // Bilinear interpolation with bounds checking
-    let height = if tx + tz <= 1.0 {
-        p1.y + (p2.y - p1.y) * tx + (p3.y - p1.y) * tz
-    } else {
-        p4.y + (p2.y - p4.y) * (1.0 - tz) + (p3.y - p4.y) * (1.0 - tx)
-    };
-
-    // Clamp height to reasonable range
-    const MAX_HEIGHT: f32 = 999.0;
-    let final_height = height.clamp(terrain_origin.y, terrain_origin.y + MAX_HEIGHT); //
-    Some(final_height)
-}
-
-fn get_movement_vector(camera: &Camera3D) -> Vector3 {
-    unsafe {
-        let mut move_dir = Vector3::zero();
-
-        // Get forward and right vectors from camera orientation
-        let mut forward = camera.target - camera.position;
-        forward.y = 0.0; // Prevent flying with W/S
+    // Only normalize if length is not zero, to avoid NaN issues with Vector3::zero().normalize()
+    if forward.length() > 0.0001 { // Check again after potential modification
         Vector3::normalize(&mut forward);
-        
-        let mut right = forward.cross(Vector3::up());
-        Vector3::normalize(&mut right);
-        
-        // Vector3::normalize(&mut move_dir);
-        // move_dir
+    }
 
-        // Movement: WASD
-        if IsKeyDown(ffi::KeyboardKey::KEY_W as i32) == true {
-            // move_dir += forward;
-            move_dir = real_vec3_add(move_dir, forward);
-        }
-        if IsKeyDown(ffi::KeyboardKey::KEY_S as i32) == true {
-            // move_dir -= forward;
-            move_dir = real_vec3_sub(move_dir, forward);
-        }
-        if IsKeyDown(ffi::KeyboardKey::KEY_D as i32) == true {
-            // move_dir += right;
-            move_dir = real_vec3_add(move_dir, right);
-        }
-        if IsKeyDown(ffi::KeyboardKey::KEY_A as i32) == true {
-            // move_dir -= right;
-            move_dir = real_vec3_sub(move_dir, right);
-        }
 
-        // Vertical movement: SPACE / SHIFT
-        if IsKeyDown(ffi::KeyboardKey::KEY_SPACE as i32) == true {
-            move_dir.y += 1.0;
-        }
-        if IsKeyDown(ffi::KeyboardKey::KEY_LEFT_SHIFT as i32) == true {
-            move_dir.y -= 1.0;
-        }
+    let mut right = forward.cross(Vector3::up());
+    if right.length() > 0.0001 { // Check before normalizing
+       Vector3::normalize(&mut right);
+    }
 
-        if move_dir.length() > 0.0 {
-            Vector3::normalize(&mut move_dir);
-            move_dir
-        } else {
-            move_dir
+
+    if rl.is_key_down(KeyboardKey::KEY_W) {
+        move_dir = real_vec3_add(move_dir, forward);
+    }
+    if rl.is_key_down(KeyboardKey::KEY_S) {
+        move_dir = real_vec3_sub(move_dir, forward);
+    }
+    if rl.is_key_down(KeyboardKey::KEY_D) {
+        move_dir = real_vec3_add(move_dir, right);
+    }
+    if rl.is_key_down(KeyboardKey::KEY_A) {
+        move_dir = real_vec3_sub(move_dir, right);
+    }
+    if rl.is_key_down(KeyboardKey::KEY_SPACE) {
+        move_dir.y += 1.0;
+    }
+    if rl.is_key_down(KeyboardKey::KEY_LEFT_SHIFT) {
+        move_dir.y -= 1.0;
+    }
+
+    if move_dir.length() > 0.0001 {
+        Vector3::normalize(&mut move_dir);
+    }
+    move_dir
+}
+
+async fn connect_and_manage_websocket(
+    mut local_player_state_rx: mpsc::UnboundedReceiver<PlayerState>,
+    server_updates_tx: mpsc::UnboundedSender<Vec<PlayerState>>,
+    player_id_confirmation_tx: mpsc::UnboundedSender<String>,
+    game_state_accessor: Arc<TokioMutex<GameState>>,
+) {
+    let url_str = "ws://127.0.0.1:8080/ws"; // Use &str directly
+
+    match connect_async(url_str).await { // CORRECTED: Pass &str
+        Ok((ws_stream, _)) => {
+            println!("CLIENT: Successfully connected to WebSocket server.");
+            let (mut write, mut read) = ws_stream.split();
+
+            let send_task = tokio::spawn(async move {
+                while let Some(player_state) = local_player_state_rx.recv().await {
+                    if let Ok(json_state) = serde_json::to_string(&player_state) {
+                        // CORRECTED: Use .into() for WsMessage::Text
+                        if write.send(WsMessage::Text(json_state.into())).await.is_err() {
+                            eprintln!("CLIENT: Failed to send player state to server.");
+                            break;
+                        }
+                    }
+                }
+                println!("CLIENT: Send task finished.");
+            });
+
+            let receive_task = tokio::spawn(async move {
+                let mut local_id_determined = false;
+                loop {
+                    tokio::select! {
+                        Some(msg_result) = read.next() => {
+                            match msg_result {
+                                Ok(WsMessage::Text(text)) => {
+                                    if let Ok(all_player_states) = serde_json::from_str::<Vec<PlayerState>>(&text) {
+                                        if !local_id_determined {
+                                            let mut gs_lock = game_state_accessor.lock().await;
+                                            if gs_lock.local_player_id.is_none() {
+                                                for r_state in &all_player_states {
+                                                    let is_initial_pos = r_state.position.0.abs() < 0.1 &&
+                                                                           (r_state.position.1 - 5.0).abs() < 0.1 &&
+                                                                           r_state.position.2.abs() < 0.1;
+                                                    if !gs_lock.other_players.contains_key(&r_state.id) {
+                                                        if is_initial_pos {
+                                                            println!("CLIENT: Deduced my ID by initial position: {}", r_state.id);
+                                                            gs_lock.local_player_id = Some(r_state.id.clone());
+                                                            let _ = player_id_confirmation_tx.send(r_state.id.clone());
+                                                            local_id_determined = true;
+                                                            break; 
+                                                        }
+                                                        if gs_lock.local_player_id.is_none() { 
+                                                            println!("CLIENT: Tentatively deduced my ID (new unknown): {}", r_state.id);
+                                                            gs_lock.local_player_id = Some(r_state.id.clone());
+                                                            let _ = player_id_confirmation_tx.send(r_state.id.clone());
+                                                        }
+                                                    }
+                                                }
+                                                if gs_lock.local_player_id.is_some() {
+                                                    local_id_determined = true;
+                                                } else if all_player_states.len() == 1 {
+                                                    println!("CLIENT: Deduced my ID (only player): {}", all_player_states[0].id);
+                                                    gs_lock.local_player_id = Some(all_player_states[0].id.clone());
+                                                    let _ = player_id_confirmation_tx.send(all_player_states[0].id.clone());
+                                                    local_id_determined = true;
+                                                }
+                                            } else {
+                                                local_id_determined = true;
+                                            }
+                                        }
+
+                                        if local_id_determined {
+                                            if server_updates_tx.send(all_player_states.clone()).is_err() {
+                                                eprintln!("CLIENT: Receiver for server updates dropped.");
+                                                break; 
+                                            }
+                                        } else {
+                                             println!("CLIENT: Waiting to determine local player ID from server broadcast...");
+                                        }
+                                    } else {
+                                        eprintln!("CLIENT: Failed to parse server message into Vec<PlayerState>: {}", text);
+                                    }
+                                }
+                                Ok(WsMessage::Close(_)) => {
+                                    println!("CLIENT: WebSocket connection closed by server.");
+                                    break; 
+                                }
+                                Err(e) => {
+                                    eprintln!("CLIENT: WebSocket read error: {}", e);
+                                    break; 
+                                }
+                                _ => { /* Ignore other message types */ }
+                            }
+                        }
+                        else => { 
+                            println!("CLIENT: WebSocket read stream ended.");
+                            break;
+                        }
+                    }
+                }
+                println!("CLIENT: Receive task finished.");
+            });
+
+            tokio::select! {
+                _ = send_task => {},
+                _ = receive_task => {},
+            }
+            println!("CLIENT: WebSocket connection handler finished.");
+        }
+        Err(e) => {
+            eprintln!("CLIENT: Failed to connect to WebSocket: {}", e);
         }
     }
 }
 
-
-fn main() {
-    unsafe {
-        SetConfigFlags(ConfigFlags::FLAG_WINDOW_RESIZABLE as u32)
-    };
+#[tokio::main]
+async fn main() {
+    unsafe { SetConfigFlags(ConfigFlags::FLAG_WINDOW_RESIZABLE as u32) };
     let (mut window_x, mut window_y) = (1920, 1080);
     let (mut rl, thread) = raylib::init()
         .size(window_x, window_y)
-        .title("Hello, World")
+        .title("Multiplayer Client")
         .build();
-    
-    let mut camera= Camera3D::perspective(
-        Vector3 { x: -250.0, y: 25.0, z: -250.0 }, 
-        Vector3 { x: -100.0, y: 12.0, z: -100.0 },
-        Vector3 {x: 0.0, y: 25.0, z: 0.0},
-        45.0
+
+    let mut camera = Camera3D::perspective(
+        Vector3 { x: -250.0, y: PLAYER_HEIGHT + 20.0, z: -250.0 },
+        Vector3 { x: -100.0, y: PLAYER_HEIGHT + 12.0, z: -100.0 },
+        Vector3::up(),
+        45.0,
     );
     let mut yaw: f32 = 0.0;
     let mut pitch: f32 = 0.0;
 
     rl.set_target_fps(FPS);
-    let (x, y, z) = (5.0, 5.0, 5.0);
-    let mut mesh: ffi::Mesh;
-    let mut model: ffi::Model;
-    let mut cylinder_mesh: ffi::Mesh;
-    let mut cylinder_model: ffi::Model;
-    let mut cylinder_image: ffi::Image;
-    let mut cylinder_texture: ffi::Texture;
-    let mut pyramid: ffi::Model;
-    let pyramid_path = CString::new("./src/Pyramid.glb").expect("cstr failed");
-    let pyramid_ptr: *const i8 = pyramid_path.as_ptr();
-    let noise_image: ffi::Image;
-    let noise_texture: ffi::Texture2D;
-    let mut terrain_mesh: ffi::Mesh;
-    let mut terrain_model: ffi::Model;
-    let mut terrain_material: ffi::Material;
-    let mut terrain_material_map: ffi::MaterialMap;
-    let mut new_terrain_mesh: *mut ffi::Mesh;
-    let mut new_terrain_model: ffi::Model;
-    let mut new_terrain_material: *mut ffi::Material;
-    let mut new_terrain_material_map: *mut ffi::MaterialMap;
-    let mut terrain_color: ffi::Color; 
-    let date = SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .expect("Duration since UNIX_EPOCH failed");
-    let mut player_direction: Vector3 = Vector3{ x: 0.0, y: 0.0, z: 0.0};
-    let mut player_speed = 50.0;
-    let terrain_vertices;
-    let terrain_vertex_count;
-	let mut mesh_points ;
-    let mut is_grounded = true;
+
+    let game_state = Arc::new(TokioMutex::new(GameState {
+        local_player_id: None,
+        other_players: HashMap::new(),
+        join_messages: VecDeque::with_capacity(MAX_JOIN_MESSAGES + 1),
+    }));
+
+    let (local_update_tx, local_update_rx) = mpsc::unbounded_channel::<PlayerState>();
+    let (server_update_tx, mut server_update_rx) = mpsc::unbounded_channel::<Vec<PlayerState>>();
+    let (player_id_confirmation_tx, mut player_id_confirmation_rx) = mpsc::unbounded_channel::<String>();
+
+    let game_state_clone_ws = game_state.clone();
+    tokio::spawn(connect_and_manage_websocket(
+        local_update_rx,
+        server_update_tx,
+        player_id_confirmation_tx,
+        game_state_clone_ws,
+    ));
+
+    let player_model_path = CString::new("./src/Soldier1.glb").expect("CString for player model failed");
+    let mut player_model: raylib::ffi::Model;
+
+    let noise_image: raylib::ffi::Image;
+    let noise_texture: raylib::ffi::Texture2D;
+    let mut terrain_mesh: raylib::ffi::Mesh;
+    let mut terrain_model: raylib::ffi::Model;
+    let terrain_vertices_vec: Vec<Vector3>;
+
     unsafe {
-        mesh = GenMeshCube(1.0, 1.0, 1.0);
-        cylinder_mesh = GenMeshCylinder(1.0, 2.0, 100);
-        cylinder_model = LoadModelFromMesh(cylinder_mesh);
-        model = LoadModelFromMesh(mesh);
-        cylinder_image = GenImageGradientLinear(20, 20, 1, ffi::ColorFromHSV(0.2, 0.7, 1.0), ffi::ColorFromHSV(0.5, 1.0, 1.0));
-        cylinder_texture = LoadTextureFromImage(cylinder_image);
-        pyramid = LoadModel(pyramid_ptr);
+        player_model = LoadModel(player_model_path.as_ptr());
+        if player_model.meshCount == 0 {
+            eprintln!("CLIENT: Failed to load player model!");
+        }
+
         noise_image = GenImagePerlinNoise(NOISE_SIZE.x as i32, NOISE_SIZE.y as i32, 0, 0, MAP_SCALE);
         noise_texture = LoadTextureFromImage(noise_image);
-        terrain_mesh = GenMeshHeightmap(noise_image, ffi::Vector3{ x: MAP_SIZE.x, y: MAP_SCALE, z: MAP_SIZE.y });
+        terrain_mesh = GenMeshHeightmap(noise_image, raylib::ffi::Vector3{ x: MAP_SIZE.x, y: MAP_SCALE, z: MAP_SIZE.y });
         terrain_model = LoadModelFromMesh(terrain_mesh);
-        SetMaterialTexture(cylinder_model.materials.wrapping_add(0), MATERIAL_MAP_ALBEDO as i32, cylinder_texture);
-        terrain_material = *terrain_model.materials.wrapping_add(0);
-        terrain_material_map = *terrain_material.maps.wrapping_add(0);
-        terrain_material_map.texture = noise_texture;
-        new_terrain_model = terrain_model;
-        (*(*terrain_model.materials.add(0)).maps.wrapping_add(MATERIAL_MAP_ALBEDO as usize)).texture = noise_texture;
-        terrain_vertices = (*terrain_model.meshes).vertices;
-        terrain_vertex_count = (*terrain_model.meshes).vertexCount;
-        terrain_color = ColorFromHSV(130.0, 1.0, 1.0);
-        mesh_points = Vec::with_capacity(terrain_vertex_count as usize);
-	    let vert_slice: &[f32] = std::slice::from_raw_parts(terrain_vertices, (terrain_vertex_count * 3) as usize);
-	
-	    for i in 0..terrain_vertex_count{
-	        let x = vert_slice[(i * 3) as usize];
-	        let y = vert_slice[(i * 3 + 1) as usize];
-	        let z = vert_slice[(i * 3 + 2) as usize];
-	        mesh_points.push(Vector3::new(x, y, z));
-            println!("{} {} {}", x, y, z);
-	    }
+        
+        if terrain_model.materialCount > 0 && !terrain_model.materials.is_null() {
+             if !(*terrain_model.materials.add(0)).maps.is_null() {
+                (*(*terrain_model.materials.add(0)).maps.wrapping_add(MATERIAL_MAP_ALBEDO as usize)).texture = noise_texture;
+            }
+        }
+
+        if terrain_model.meshCount > 0 && !terrain_model.meshes.is_null() { // Check mesh pointer
+            let raw_vertices_ptr = (*terrain_model.meshes).vertices; 
+            let vertex_count = (*terrain_model.meshes).vertexCount as usize;
+            if !raw_vertices_ptr.is_null() && vertex_count > 0 { // Check vertices pointer
+                let vert_slice: &[f32] = std::slice::from_raw_parts(raw_vertices_ptr, vertex_count * 3);
+                
+                let mut temp_verts = Vec::with_capacity(vertex_count);
+                for i in 0..vertex_count {
+                    temp_verts.push(Vector3::new(
+                        vert_slice[i * 3],
+                        vert_slice[i * 3 + 1],
+                        vert_slice[i * 3 + 2],
+                    ));
+                }
+                terrain_vertices_vec = temp_verts;
+            } else {
+                eprintln!("CLIENT: Terrain mesh vertices are null or count is zero.");
+                terrain_vertices_vec = Vec::new(); // Initialize to empty to prevent crash
+            }
+        } else {
+            eprintln!("CLIENT: Terrain model has no meshes or mesh pointer is null.");
+            terrain_vertices_vec = Vec::new(); // Initialize to empty
+        }
         UnloadImage(noise_image);
     }
-    let mut terrain_position: ffi::Vector3 = ffi::Vector3 {x: -MAP_SIZE.x, y: 0.0, z: -MAP_SIZE.y};
-    rl.disable_cursor();
-    while !rl.window_should_close() {
-        let mut dt = rl.get_frame_time();
-        let mut d = rl.begin_drawing(&thread);
-        // position.y += 2.0*dt;
-        d.clear_background(Color::SKYBLUE);
-        let mouse = d.get_mouse_position();
-        
-		//         unsafe {
-		//     // Raw movement input
-		//     let input_x = (IsKeyDown(ffi::KeyboardKey::KEY_D as i32) as i64 - IsKeyDown(ffi::KeyboardKey::KEY_A as i32) as i64) as f32;
-		//     let input_z = (IsKeyDown(ffi::KeyboardKey::KEY_W as i32) as i64 - IsKeyDown(ffi::KeyboardKey::KEY_S as i32) as i64) as f32;
-		//     let input_y = (IsKeyDown(ffi::KeyboardKey::KEY_SPACE as i32) as i64 - IsKeyDown(ffi::KeyboardKey::KEY_LEFT_SHIFT as i32) as i64) as f32;
-		
-		//     // Compute yaw from camera direction
-		//     let delta_x = camera.target.x - camera.position.x;
-		//     let delta_z = camera.target.z - camera.position.z;
-		//     let yaw = delta_z.atan2(delta_x);
-		
-		//     // Apply yaw rotation to input to get camera-relative movement
-		//     player_direction.x = input_x * yaw.cos() - input_z * yaw.sin();
-		//     player_direction.z = input_x * yaw.sin() + input_z * yaw.cos();
-		//     player_direction.y = input_y;
-		// }
-        // 
+    let terrain_position = raylib::ffi::Vector3 {x: -MAP_SIZE.x, y: 0.0, z: -MAP_SIZE.y};
+    let terrain_color_val: raylib::ffi::Color = unsafe { ColorFromHSV(130.0, 1.0, 1.0) };
 
-        // if let Some(terrain_y) = get_height_at(camera.position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize) {
-	    //     if camera.position.y < terrain_y+5.0 {
-        //         camera.position.y = terrain_y+5.1;
-	    //     }
-        // }
-        let key = d.get_key_pressed();
-        window_x = d.get_render_width();
-        window_y = d.get_render_height();
-           let mouse_delta = d.get_mouse_delta();
-	    let sensitivity = 0.003;
-	    yaw += mouse_delta.x * sensitivity;
-	    pitch -= mouse_delta.y * sensitivity;
-	    
-	    let pitch_limit = std::f32::consts::FRAC_PI_2 - 0.01;
-	    pitch = pitch.clamp(-pitch_limit, pitch_limit);
-	    
-	    let forward = Vector3 {
-	        x: pitch.cos() * yaw.sin(),
-	        y: pitch.sin(),
-	        z: pitch.cos() * yaw.cos() * -1.0
-	    };
+
+    rl.disable_cursor();
+    let player_speed = 50.0;
+
+    while !rl.window_should_close() {
+        let dt = rl.get_frame_time();
+
+        if rl.is_cursor_on_screen() && rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+        }
+        if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+        }
         
-        player_direction = get_movement_vector(&camera);
-        let desired_position = camera.position + player_direction * player_speed * dt;
+        if rl.is_cursor_hidden() {
+            let mouse_delta = rl.get_mouse_delta();
+            let sensitivity = 0.003;
+            yaw += mouse_delta.x * sensitivity;
+            pitch -= mouse_delta.y * sensitivity;
+
+            let pitch_limit = std::f32::consts::FRAC_PI_2 - 0.01;
+            pitch = pitch.clamp(-pitch_limit, pitch_limit);
+        }
         
-        // if is_grounded && IsKeyPressed(KeyboardKey::KEY_SPACE) {
-        //     velocity
-        // }
+        let camera_forward_vector = Vector3 {
+            x: pitch.cos() * yaw.sin(),
+            y: pitch.sin(),
+            z: pitch.cos() * yaw.cos() * -1.0,
+        };
+        let movement_input = get_movement_vector(&rl, &camera, yaw);
+        let desired_position = camera.position + movement_input * player_speed * dt;
         
         let mut new_position = desired_position;
-        if check_collision(desired_position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize) {
-            new_position = adjust_position(desired_position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize);
-            
-            // Cancel vertical movement if colliding from above
-            if player_direction.y < 0.0 {
-                player_direction.y = 0.0;
-                new_position = camera.position + player_direction * player_speed * dt;
-                new_position = adjust_position(new_position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize);
+        let terrain_grid_width = NOISE_SIZE.x as usize;
+        let terrain_grid_depth = NOISE_SIZE.y as usize;
+
+        if !terrain_vertices_vec.is_empty() { // Only do collision if terrain vertices exist
+            if check_collision(desired_position, terrain_position.into(), &terrain_vertices_vec, terrain_grid_width, terrain_grid_depth) {
+                new_position = adjust_position(desired_position, terrain_position.into(), &terrain_vertices_vec, terrain_grid_width, terrain_grid_depth);
+                if movement_input.y < 0.0 {
+                     let mut horizontal_movement = movement_input;
+                     horizontal_movement.y = 0.0;
+                     if horizontal_movement.length() > 0.0001 {
+                        Vector3::normalize(&mut horizontal_movement);
+                     }
+                     let corrected_horizontal_pos = camera.position + horizontal_movement * player_speed * dt;
+                     new_position = adjust_position(corrected_horizontal_pos, terrain_position.into(), &terrain_vertices_vec, terrain_grid_width, terrain_grid_depth);
+                }
+            }
+        }
+        camera.position = new_position;
+        camera.target = camera.position + camera_forward_vector;
+
+
+        if let Ok(confirmed_id) = player_id_confirmation_rx.try_recv() {
+            let mut gs = game_state.lock().await;
+            if gs.local_player_id.is_none() {
+                println!("MAIN_LOOP: Received and set local player ID: {}", confirmed_id);
+                gs.local_player_id = Some(confirmed_id);
             }
         }
 
-        camera.position = new_position;
-        camera.target = camera.position + forward;
-
-        // Draw debug information
-        if let Some(ground_height) = get_closest_vertex_height(camera.position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize) {
-            // d.draw_text(&format!("Ground Height: {:.2}", ground_height), 10, 200, 20, Color::RED);
-            println! ("{:.2}", ground_height);
+        while let Ok(all_states_update) = server_update_rx.try_recv() {
+            let mut gs = game_state.lock().await;
+            let mut current_other_players = HashMap::new();
+            if let Some(local_id) = &gs.local_player_id.clone() {
+                for state in all_states_update {
+                    if &state.id != local_id {
+                        if !gs.other_players.contains_key(&state.id) {
+                            let join_msg = format!("Player {}... joined", state.id.chars().take(6).collect::<String>());
+                            println!("CLIENT: {}", join_msg);
+                            gs.join_messages.push_back(join_msg);
+                            if gs.join_messages.len() > MAX_JOIN_MESSAGES {
+                                gs.join_messages.pop_front();
+                            }
+                        }
+                        current_other_players.insert(state.id.clone(), state);
+                    }
+                }
+                gs.other_players = current_other_players;
+            }
         }
-
-        // Then handle vertical movement separately
-        // let vertical_direction: f32;
-        // unsafe {
-	    //     vertical_direction = if IsKeyDown(ffi::KeyboardKey::KEY_SPACE as i32) {
-	    //         1.0
-	    //     } else if IsKeyDown(ffi::KeyboardKey::KEY_LEFT_SHIFT as i32) {
-	    //         -1.0
-	    //     } else {
-	    //         0.0
-	    //     };
-
-        // }
-        // new_position.y += vertical_direction * player_speed * dt;
-
-		
-        // // player_direction = get_movement_vector(&camera);
-        // // let mut new_position = camera.position + player_direction * player_speed * dt;
-        
-        //  if let Some(terrain_y) = get_height_at(new_position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize) {
-        //     let target_height = terrain_y + PLAYER_HEIGHT;
-            
-        //     // Only adjust if we're at or below target height
-        //     if new_position.y <= target_height {
-        //         new_position.y = target_height;
-        //     }
-            
-        //     // Additional check to prevent getting stuck in steep terrain
-        //     if (new_position.y - target_height).abs() < 0.5 { //
-        //         new_position.y = target_height;
-        //     }
-        // }
-
-        
-        // if let Some(terrain_y) = get_height_at(new_position, raylib::prelude::Vector3::from(terrain_position), &mesh_points, GRID_SIZE.x as usize, GRID_SIZE.y as usize) { //
-        //     if new_position.y < terrain_y + PLAYER_HEIGHT { //
-        //         new_position.y = terrain_y + PLAYER_HEIGHT; //
-                
-        //         // Prevent moving downward into terrain
-        //         if player_direction.y < 0.0 { //
-        //             player_direction.y = 0.0; //
-        //         }
-        //     }
-        // }
-        
-
-        // match key {
-        //     Some(KeyboardKey::KEY_A) => camera.position.x += x,
-        //     Some(KeyboardKey::KEY_S) => camera.position.z -= z,
-        //     Some(KeyboardKey::KEY_D) => camera.position.x -= x,
-        //     Some(KeyboardKey::KEY_W) => camera.position.z += z,
-        //     Some(KeyboardKey::KEY_SPACE) => camera.position.y += y,
-        //     Some(KeyboardKey::KEY_LEFT_SHIFT) => camera.position.y -= y,
-        //     _ => {}
-        // }
-
-        // unsafe {
-        //     // player_direction.x = (IsKeyDown(ffi::KeyboardKey::KEY_A as i32) as i64 - IsKeyDown(ffi::KeyboardKey::KEY_D as i32) as i64) as f32;
-        //     // player_direction.y = (IsKeyDown(ffi::KeyboardKey::KEY_SPACE as i32) as i64 - IsKeyDown(ffi::KeyboardKey::KEY_LEFT_SHIFT as i32) as i64) as f32;
-        //     // player_direction.z = (IsKeyDown(ffi::KeyboardKey::KEY_W as i32) as i64 - IsKeyDown(ffi::KeyboardKey::KEY_S as i32) as i64) as f32;
-        // }
-        
-        // camera.position.x += player_direction.x * player_speed * dt;
-        // camera.position.y += player_direction.y * player_speed * dt;
-        // camera.position.z += player_direction.z * player_speed * dt;
-        
-        
 
         {
-            let mut d3= d.begin_mode3D(camera);
-            let rings = 10;
-            // d3.draw_grid(100, 1.0);
-            // d3.draw_sphere_wires(Vector3{x: -250.0, y: 800.0, z: -250.0}, 200.0, rings, rings, Color::BLACK);
-            // d3.draw_sphere_wires(Vector3{x: -248.0, y: 795.0, z: -250.0}, 199.5, rings, rings, Color::BLACK);
-            // d3.draw_sphere_wires(Vector3{x: -246.0, y: 790.0, z: -250.0}, 199.0, rings, rings, Color::BLACK);
-            // d3.draw_sphere_wires(Vector3{x: -244.0, y: 785.0, z: -250.0}, 198.5, rings, rings, Color::BLACK);
-            // d3.draw_sphere_wires(Vector3{x: -242.0, y: 780.0, z: -250.0}, 198.0, rings, rings, Color::BLACK);
-            // // d3.draw_sphere_ex(Vector3{x: -250.0, y: 690.0, z: -250.0}, 100.0, rings, rings, Color::BLACK);
-            // d3.draw_sphere_ex(Vector3{x: -250.0, y: 800.0, z: -250.0}, 200.0, rings, rings, Color::WHITE);
-            d3.draw_sphere_ex(Vector3{x: 0.0, y: 150.0, z: -800.0}, 15.0, rings, rings, Color::YELLOW);
-            d3.draw_sphere_ex(Vector3{x: 0.0, y: 150.0, z: -800.0}, 12.0, rings, rings, Color::ORANGE);
-            unsafe {
-                // for i in 0..25 {
-                //     for j in 0..25 {
-                //         DrawModel(terrain_model, real_vec3_add(terrain_position, ffi::Vector3{x: i as f32 * 10.0, y: 0.0, z: j as f32 * 10.0}), 1.0, terrain_color);
-                //     }
-                // }
-                DrawModel(terrain_model, terrain_position, 1.0, terrain_color);
+            let gs = game_state.lock().await;
+            if let Some(local_id) = &gs.local_player_id {
+                let local_player_state = PlayerState {
+                    id: local_id.clone(),
+                    position: (camera.position.x, camera.position.y, camera.position.z),
+                    rotation: (pitch, yaw, 0.0),
+                };
+                let _ = local_update_tx.send(local_player_state);
             }
-            // d3.draw_line_3D(Vector3{x: -4.0, y: 0.0, z: -2.0}, Vector3{x: 5.0, y: 2.0, z: 3.0}, Color::LIME);
         }
-        d.draw_text(&format!("{}, {}", window_x, window_y), 0, 0, 30, Color::LIME);
-        d.draw_text(&format!("{:3.2}, {:3.2}, {:3.2}", camera.position.x, camera.position.y, camera.position.z), 0, 50, 30, Color::RED);
-        d.draw_fps(0, 100);
+        
+        let mut d = rl.begin_drawing(&thread);
+        d.clear_background(Color::SKYBLUE);
+
+        {
+            let mut d3 = d.begin_mode3D(camera);
+            unsafe {
+                DrawModel(terrain_model, terrain_position, 1.0, terrain_color_val);
+            }
+            // CORRECTED: Use Ok() for try_lock() result
+            if let Ok(locked_gs) = game_state.try_lock() {
+                for player_state in locked_gs.other_players.values() {
+                    let pos = Vector3 {
+                        x: player_state.position.0,
+                        y: player_state.position.1 - PLAYER_HEIGHT,
+                        z: player_state.position.2,
+                    };
+                    let rot_axis = Vector3::up();
+                    let rot_angle_rad = player_state.rotation.1;
+                    let rot_angle_deg = rot_angle_rad.to_degrees();
+                    let model_scale = raylib::ffi::Vector3 { x: 3.0, y: 3.0, z: 3.0 };
+
+                    if player_model.meshCount > 0 {
+                         unsafe {
+                            println! ("{:3.2} {:3.2} {:3.2}", pos.x, pos.y, pos.z);
+                            println! ("{:3.2} {:3.2} {:3.2}", rot_axis.x, rot_axis.y, rot_axis.z);
+                            DrawModelEx(player_model, pos.into(), rot_axis.into(), rot_angle_deg, model_scale, Color::BLACK.into());
+                        }
+                    }
+                }
+            }
+             d3.draw_sphere_ex(Vector3{x: 0.0, y: 150.0, z: -800.0}, 15.0, 10, 10, Color::YELLOW);
+             d3.draw_sphere_ex(Vector3{x: 0.0, y: 150.0, z: -800.0}, 12.0, 10, 10, Color::ORANGE);
+        }
+
+        window_x = d.get_render_width();
+        window_y = d.get_render_height();
+        d.draw_text(&format!("Screen: {}x{}", window_x, window_y), 10, 10, 20, Color::LIME);
+        d.draw_text(&format!("Pos: {:.1}, {:.1}, {:.1}", camera.position.x, camera.position.y, camera.position.z), 10, 40, 20, Color::RED);
+        d.draw_fps(10, 70);
+
+        // CORRECTED: Use Ok() for try_lock() result
+        if let Ok(locked_gs) = game_state.try_lock() {
+            let mut y_offset = 100;
+            for msg in locked_gs.join_messages.iter() {
+                d.draw_text(msg, 10, y_offset, 20, Color::YELLOW);
+                y_offset += 25;
+            }
+        }
     }
 }
