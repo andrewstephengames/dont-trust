@@ -1,11 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::sync::Arc;
+use rand::Rng;
 
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 use raylib::consts::MouseButton;
-use raylib::ffi::{ColorFromHSV, KeyboardKey};
+use raylib::ffi::{Color, ColorFromHSV, IsKeyDown, IsKeyReleased, KeyboardKey};
 use raylib::{
     consts::MaterialMapIndex::*,
     core::math::*, // RaylibThread is in prelude, texture::* also generally covered
@@ -370,7 +371,7 @@ async fn main() {
 
 
     rl.disable_cursor();
-    let player_speed = 50.0;
+    let mut player_speed = 50.0;
 
     while !rl.window_should_close() {
         let dt = rl.get_frame_time();
@@ -396,6 +397,7 @@ async fn main() {
             z: pitch.cos() * yaw.cos() * -1.0,
         };
         let movement_input = get_movement_vector(&rl, &camera, yaw);
+        // player_speed += 10.0;
         let desired_position = camera.position + movement_input * player_speed * dt;
         
         let mut new_position = desired_position;
@@ -462,7 +464,14 @@ async fn main() {
         }
         
         let mut d = rl.begin_drawing(&thread);
-        d.clear_background(Color::SKYBLUE);
+        d.clear_background(raylib::prelude::Color::SKYBLUE);
+        let mut orange_toggle: bool = false;
+        
+        unsafe {
+	        if IsKeyDown(71) {
+	            orange_toggle = !orange_toggle;
+            }
+        }
 
         {
             let mut d3 = d.begin_mode3D(camera);
@@ -472,7 +481,7 @@ async fn main() {
             // CORRECTED: Use Ok() for try_lock() result
             if let Ok(locked_gs) = game_state.try_lock() {
                 for player_state in locked_gs.other_players.values() {
-                    let pos = Vector3 {
+                    let mut pos = Vector3 {
                         x: player_state.position.0,
                         y: player_state.position.1 - PLAYER_HEIGHT,
                         z: player_state.position.2,
@@ -480,32 +489,37 @@ async fn main() {
                     let rot_axis = Vector3::up();
                     let rot_angle_rad = player_state.rotation.1;
                     let rot_angle_deg = rot_angle_rad.to_degrees();
-                    let model_scale = raylib::ffi::Vector3 { x: 3.0, y: 3.0, z: 3.0 };
+                    let model_scale = raylib::ffi::Vector3 { x: 50.0, y: 50.0, z: 50.0 };
 
-                    if player_model.meshCount > 0 {
+                    // if player_model.meshCount > 0 {
                          unsafe {
-                            println! ("{:3.2} {:3.2} {:3.2}", pos.x, pos.y, pos.z);
-                            println! ("{:3.2} {:3.2} {:3.2}", rot_axis.x, rot_axis.y, rot_axis.z);
-                            DrawModelEx(player_model, pos.into(), rot_axis.into(), rot_angle_deg, model_scale, Color::BLACK.into());
+                            // println! ("{:3.2} {:3.2} {:3.2}", pos.x, pos.y, pos.z);
+                            // println! ("{:3.2} {:3.2} {:3.2}", rot_axis.x, rot_axis.y, rot_axis.z);
+                            // pos = Vector3{x: rng.random_range(-50..-450) as f32, y: rng.random_range(5..20) as f32, z: rng.random_range(-50..-450) as f32 };
+                            
+                            DrawModelEx(player_model, pos.into(), rot_axis.into(), rot_angle_deg, model_scale, ColorFromHSV(0.0 as f32, 1.0, 0.0));
                         }
-                    }
+                        d3.draw_sphere(pos, 1.0, raylib::prelude::Color::RED);
+                    // }
                 }
             }
-             d3.draw_sphere_ex(Vector3{x: 0.0, y: 150.0, z: -800.0}, 15.0, 10, 10, Color::YELLOW);
-             d3.draw_sphere_ex(Vector3{x: 0.0, y: 150.0, z: -800.0}, 12.0, 10, 10, Color::ORANGE);
+             d3.draw_sphere_ex(Vector3{x: 0.0, y: 150.0, z: -800.0}, 15.0, 10, 10, raylib::prelude::Color::YELLOW);
+             if !orange_toggle {
+                d3.draw_sphere_ex(Vector3{x: 0.0, y: 150.0, z: -800.0}, 12.0, 10, 10, raylib::prelude::Color::ORANGE);
+             }
         }
 
         window_x = d.get_render_width();
         window_y = d.get_render_height();
-        d.draw_text(&format!("Screen: {}x{}", window_x, window_y), 10, 10, 20, Color::LIME);
-        d.draw_text(&format!("Pos: {:.1}, {:.1}, {:.1}", camera.position.x, camera.position.y, camera.position.z), 10, 40, 20, Color::RED);
+        d.draw_text(&format!("Screen: {}x{}", window_x, window_y), 10, 10, 20, raylib::prelude::Color::LIME);
+        d.draw_text(&format!("Pos: {:.1}, {:.1}, {:.1}", camera.position.x, camera.position.y, camera.position.z), 10, 40, 20, raylib::prelude::Color::RED);
         d.draw_fps(10, 70);
 
         // CORRECTED: Use Ok() for try_lock() result
         if let Ok(locked_gs) = game_state.try_lock() {
             let mut y_offset = 100;
             for msg in locked_gs.join_messages.iter() {
-                d.draw_text(msg, 10, y_offset, 20, Color::YELLOW);
+                d.draw_text(msg, 10, y_offset, 20, raylib::prelude::Color::YELLOW);
                 y_offset += 25;
             }
         }
